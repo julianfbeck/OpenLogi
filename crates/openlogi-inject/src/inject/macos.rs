@@ -16,7 +16,7 @@ use openlogi_core::config::FunctionKey;
 
 use super::{HeldKey, HeldModifiers, KeyPhase};
 
-/// Shared resolver for private ApplicationServices and SkyLight SPI.
+/// Shared resolver for private ApplicationServices SPI.
 #[expect(
     unsafe_code,
     reason = "private ApplicationServices SPI symbols are resolved via dlopen/dlsym FFI"
@@ -57,12 +57,6 @@ mod main_thread;
 )]
 mod menu_shortcut;
 mod scroll;
-/// DockSwipe events with read-only, per-display Space confirmation.
-#[expect(
-    unsafe_code,
-    reason = "read-only SkyLight SPI and AppKit notification registration require FFI"
-)]
-mod spaces;
 /// Screenshots, posted through their system symbolic hotkey records.
 ///
 /// That respects the user's configured shortcut instead of assuming one, is
@@ -83,7 +77,6 @@ use keyboard_layout::layout_key;
 use menu_shortcut::{MenuPress, MenuShortcut};
 use scroll::dispatch_scroll;
 pub(super) use scroll::{post_phased_scroll, post_scroll, post_smooth_scroll};
-use spaces::{next_desktop, previous_desktop};
 use symbolic_hotkey::{capture_region, screenshot};
 
 // NX_KEYTYPE_* constants from <IOKit/hidsystem/ev_keymap.h>.
@@ -246,16 +239,15 @@ fn combo(shortcut: Shortcut) -> KeyCombo {
 
 /// Dispatch a window-manager or power [`NativeAction`].
 ///
-/// Window-manager actions and screenshots go straight to the Dock or
-/// WindowServer through private SPIs rather than a synthesised keyboard chord
-/// — see the module docs on [`mission_control`] and friends for why. Lock
-/// Screen is an Apple menu item, reachable only by its chord.
+/// Dock actions and screenshots use private SPIs; adjacent desktops use the
+/// same Control-arrow keyboard events as Logitech Options. Lock Screen is an
+/// Apple menu item, reachable only by its chord.
 fn dispatch_native(native: NativeAction) {
     match native {
         NativeAction::MissionControl => mission_control(),
         NativeAction::AppExpose => app_expose(),
-        NativeAction::PreviousDesktop => previous_desktop(),
-        NativeAction::NextDesktop => next_desktop(),
+        NativeAction::PreviousDesktop => switch_desktop(DesktopDirection::Previous),
+        NativeAction::NextDesktop => switch_desktop(DesktopDirection::Next),
         NativeAction::ShowDesktop => show_desktop(),
         NativeAction::LaunchpadShow => launchpad(),
         // The Apple menu's Lock Screen item matches the character Q, so the
@@ -383,6 +375,59 @@ fn key_event(vk: u16, flags: CGEventFlags, phase: KeyPhase) -> Option<CGEvent> {
 fn post_key(vk: u16, flags: CGEventFlags) {
     post_key_phase(vk, flags, KeyPhase::Down);
     post_key_phase(vk, flags, KeyPhase::Up);
+}
+
+#[derive(Clone, Copy)]
+enum DesktopDirection {
+    Previous,
+    Next,
+}
+
+/// Match Options' Control-arrow press and explicit Control release, without
+/// a private Dock gesture or a confirmation lease that drops quick repeats.
+fn switch_desktop(direction: DesktopDirection) {
+    let snapshot = CGEventSource::new(CGEventSourceStateID::HIDSystemState).and_then(CGEvent::new);
+    let Ok(snapshot) = snapshot else {
+        tracing::warn!("CGEvent modifier snapshot failed for desktop switch");
+        return;
+    };
+    let Some(events) = desktop_key_events(direction, snapshot.get_flags()) else {
+        return;
+    };
+    for event in events {
+        event.post(CGEventTapLocation::HID);
+    }
+}
+
+fn desktop_key_events(
+    direction: DesktopDirection,
+    held_flags: CGEventFlags,
+) -> Option<Vec<CGEvent>> {
+    let arrow = match direction {
+        DesktopDirection::Previous => 0x7b,
+        DesktopDirection::Next => 0x7c,
+    };
+    let control = CGEventFlags::CGEventFlagControl;
+    // Resolve every event before posting any, so an allocation failure cannot
+    // leave Control or an arrow logically pressed. Existing physical/synthetic
+    // modifiers return on the final edge, and an already-held Control is never
+    // released by this one-shot action.
+    let arrow_up_flags = if held_flags.contains(control) {
+        held_flags
+    } else {
+        control
+    };
+    let mut events = vec![
+        key_event(arrow, control, KeyPhase::Down)?,
+        key_event(arrow, arrow_up_flags, KeyPhase::Up)?,
+    ];
+    if !held_flags.contains(control) {
+        events.push(key_event(0x3b, held_flags, KeyPhase::Up)?);
+    }
+    for event in &events {
+        event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 0);
+    }
+    Some(events)
 }
 
 /// Type an arbitrary unicode string by emitting one key event per character,

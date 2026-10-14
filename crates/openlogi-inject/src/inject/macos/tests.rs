@@ -1,7 +1,9 @@
-use core_graphics::event::{CGEventFlags, EventField};
+use core_graphics::event::{CGEventFlags, CGEventType, EventField};
 use openlogi_core::binding::Shortcut;
 
-use super::{combo, held_key_event, hid_usage_to_macos, key_event};
+use super::{
+    DesktopDirection, combo, desktop_key_events, held_key_event, hid_usage_to_macos, key_event,
+};
 use crate::inject::{HeldKey, HeldModifiers, KeyPhase};
 
 #[test]
@@ -76,4 +78,65 @@ fn posted_key_edges_carry_the_synthetic_tag() {
             crate::SYNTHETIC_EVENT_USER_DATA
         );
     }
+}
+
+#[test]
+fn desktop_action_uses_logitech_control_arrow_sequence() {
+    for (direction, arrow) in [
+        (DesktopDirection::Previous, 0x7b),
+        (DesktopDirection::Next, 0x7c),
+    ] {
+        let events = desktop_key_events(direction, CGEventFlags::CGEventFlagNull)
+            .expect("desktop events allocate");
+        assert_eq!(events.len(), 3);
+        for (event, (kind, key, flags)) in events.iter().zip([
+            (
+                CGEventType::KeyDown,
+                arrow,
+                CGEventFlags::CGEventFlagControl,
+            ),
+            (CGEventType::KeyUp, arrow, CGEventFlags::CGEventFlagControl),
+            (
+                CGEventType::FlagsChanged,
+                0x3b,
+                CGEventFlags::CGEventFlagNull,
+            ),
+        ]) {
+            assert_eq!(event.get_type() as u32, kind as u32);
+            assert_eq!(
+                event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE),
+                key,
+            );
+            assert_eq!(event.get_flags(), flags);
+            assert_eq!(
+                event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT),
+                0,
+            );
+            assert_eq!(
+                event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA),
+                crate::SYNTHETIC_EVENT_USER_DATA,
+            );
+        }
+    }
+}
+
+#[test]
+fn desktop_action_preserves_an_already_held_control() {
+    let held = CGEventFlags::CGEventFlagControl | CGEventFlags::CGEventFlagShift;
+    let events = desktop_key_events(DesktopDirection::Next, held).expect("desktop events allocate");
+    assert_eq!(events.len(), 2, "do not release the user's held Control");
+    assert_eq!(events[0].get_flags(), CGEventFlags::CGEventFlagControl);
+    assert!(matches!(events[1].get_type(), CGEventType::KeyUp));
+    assert_eq!(events[1].get_flags(), held);
+}
+
+#[test]
+fn desktop_action_restores_other_held_modifiers_after_its_chord() {
+    let held = CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagAlternate;
+    let events =
+        desktop_key_events(DesktopDirection::Previous, held).expect("desktop events allocate");
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].get_flags(), CGEventFlags::CGEventFlagControl);
+    assert_eq!(events[1].get_flags(), CGEventFlags::CGEventFlagControl);
+    assert_eq!(events[2].get_flags(), held);
 }
