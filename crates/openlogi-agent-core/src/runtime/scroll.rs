@@ -454,6 +454,9 @@ struct ActiveMotion {
     /// position.
     settled: WheelDelta,
     emitted: WheelDelta,
+    /// A timer can advance a source before a previously timestamped hook
+    /// input reaches the queue. Position evaluations must never rewind it.
+    evaluated_at: Instant,
     next_frame: Instant,
     /// Trailing [`ACCEL_WINDOW`] of accepted ticks — `(arrival, unsigned raw
     /// wheel distance per axis)` — from which [`accel_gain`] derives each
@@ -468,6 +471,7 @@ impl ActiveMotion {
             pulses: Vec::new(),
             settled: WheelDelta::ZERO,
             emitted: WheelDelta::ZERO,
+            evaluated_at: at,
             next_frame: at + FRAME_PERIOD,
             recent_ticks: VecDeque::new(),
         };
@@ -517,7 +521,7 @@ impl ActiveMotion {
         }
     }
 
-    /// Superpose one tick's pulse and evaluate the position at its timestamp.
+    /// Superpose one tick's pulse, evaluating only an already-due frame.
     ///
     /// Ticks landing within one frame of the newest pulse's first tick merge
     /// into that pulse when both run the same duration — but never by
@@ -529,8 +533,14 @@ impl ActiveMotion {
     /// own pulse instead, so a reload never re-times motion accepted under
     /// the previous configuration. Only the [`MAX_PULSES`] bound merges
     /// unconditionally; that is the one place the model approximates, and it
-    /// still conserves distance and continuity.
-    fn add_tick(&mut self, impulse: WheelDelta, at: Instant, tuning: MotionTuning) -> MotionUpdate {
+    /// still conserves distance and continuity. Input never postpones the
+    /// scheduled frame or creates an extra frame between timer deadlines.
+    fn add_tick(
+        &mut self,
+        impulse: WheelDelta,
+        at: Instant,
+        tuning: MotionTuning,
+    ) -> Option<MotionUpdate> {
         let gain = self.windowed_gain(impulse, at, tuning);
         let amplitude = impulse.scale(tuning.step).scale_axes(gain);
         let merge = self.pulses.len() >= MAX_PULSES
@@ -539,7 +549,9 @@ impl ActiveMotion {
                     && at.saturating_duration_since(pulse.anchor) < FRAME_PERIOD
             });
         if merge && let Some(last) = self.pulses.last_mut() {
-            let delivered = last.position_at(at);
+            // Retain a delayed tick's own clock without undoing a timer's
+            // already-evaluated contribution from the pulse it merges into.
+            let delivered = last.position_at(at.max(self.evaluated_at));
             self.settled = self.settled.plus(delivered);
             let remainder = last.amplitude.minus(delivered).plus(amplitude);
             if remainder.is_zero() {
@@ -557,19 +569,20 @@ impl ActiveMotion {
                 anchor: at,
             });
         }
-        let update = self.evaluate(at);
-        if !update.is_finished() {
-            // Never re-evaluate before the tick's own timestamp: an already
-            // due frame deadline would read an earlier position and emit an
-            // opposing delta.
-            self.next_frame = at + FRAME_PERIOD;
+        if self.pulses.is_empty() {
+            // Equal opposing input may cancel before the first frame.
+            Some(self.evaluate(at))
+        } else if self.next_frame <= at {
+            Some(self.advance(at))
+        } else {
+            None
         }
-        update
     }
 
     /// Evaluate the position at `at` and report whether the source remains
     /// active after this update.
     fn advance(&mut self, at: Instant) -> MotionUpdate {
+        let at = at.max(self.evaluated_at);
         let update = self.evaluate(at);
         if !update.is_finished() {
             while self.next_frame <= at {
@@ -583,6 +596,8 @@ impl ActiveMotion {
     }
 
     fn evaluate(&mut self, at: Instant) -> MotionUpdate {
+        let at = at.max(self.evaluated_at);
+        self.evaluated_at = at;
         let position = self.position_at(at);
         let delta = self.delta_to(position);
         self.prune(at);
@@ -725,10 +740,10 @@ impl ScrollEngine {
         let update = match self.active.entry(source) {
             Entry::Occupied(mut entry) => {
                 let update = entry.get_mut().add_tick(impulse, at, tuning);
-                if update.is_finished() {
+                if update.is_some_and(|update| update.is_finished()) {
                     entry.remove();
                 }
-                Some(update)
+                update
             }
             Entry::Vacant(entry) => {
                 entry.insert(ActiveMotion::new(impulse, at, tuning));

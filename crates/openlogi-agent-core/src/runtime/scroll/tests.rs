@@ -860,6 +860,93 @@ fn same_sign_input_never_emits_an_opposing_frame() {
 }
 
 #[test]
+fn delayed_input_after_a_timer_frame_never_rewinds_positive_motion() {
+    let base = Instant::now();
+    let glide = tuning(1.0, 360, 1.0);
+    for first_millis in [0, 92] {
+        let mut engine = ScrollEngine::default();
+        let mut frames = Vec::new();
+        engine.impulse(
+            source(),
+            wheel(0.0, 1.0),
+            base + Duration::from_millis(first_millis),
+            glide,
+            &mut |frame| frames.push(frame),
+        );
+        engine.advance_due(base + Duration::from_millis(100), &mut |frame| {
+            frames.push(frame);
+        });
+
+        // A hook can timestamp input just before a timer fires, but enqueue it
+        // after the source has advanced. Test both a new pulse and an in-frame
+        // merge, whose settlement must preserve the timer's progress too.
+        engine.impulse(
+            source(),
+            wheel(0.0, 1.0),
+            base + Duration::from_millis(99),
+            glide,
+            &mut |frame| frames.push(frame),
+        );
+        for millis in (108..=452).step_by(8).chain([459]) {
+            engine.advance_due(base + Duration::from_millis(millis), &mut |frame| {
+                frames.push(frame);
+            });
+        }
+
+        assert!(
+            frames.iter().all(|frame| frame.delta.y >= 0.0),
+            "positive input must never emit a rewind: {frames:?}"
+        );
+        assert_delta(cumulative(&frames), wheel(0.0, 2.0));
+        assert_eq!(engine.next_deadline(), None);
+    }
+}
+
+#[test]
+fn dense_input_keeps_frame_cadence_and_finishes_at_its_original_deadline() {
+    let base = Instant::now();
+    let mut engine = ScrollEngine::default();
+    let mut frames = Vec::new();
+    // A 1 kHz free-spin stream must update motion without turning every
+    // accepted tick into an output event or postponing the next timer frame.
+    for millis in 0..=1099 {
+        let at = base + Duration::from_millis(millis);
+        if millis < 1000 {
+            engine.impulse(source(), wheel(0.0, 0.1), at, neutral(), &mut |frame| {
+                frames.push((at, frame));
+            });
+        }
+        engine.advance_due(at, &mut |frame| frames.push((at, frame)));
+    }
+
+    assert_eq!(
+        frames.first().map(|(at, _)| *at),
+        Some(base + FRAME_PERIOD),
+        "the first tick's scheduled response must survive dense input"
+    );
+    for pair in frames.windows(2) {
+        if pair[1].1.phase != SmoothScrollPhase::Ended {
+            assert!(
+                pair[1].0.duration_since(pair[0].0) >= FRAME_PERIOD,
+                "input emitted sooner than the frame cadence: {pair:?}"
+            );
+        }
+    }
+    assert!(frames.iter().all(|(_, frame)| frame.delta.y >= 0.0));
+    assert_delta(
+        cumulative(&frames.iter().map(|(_, frame)| *frame).collect::<Vec<_>>()),
+        wheel(0.0, 100.0),
+    );
+    assert_eq!(
+        frames.last().map(|(at, frame)| (*at, frame.phase)),
+        Some((base + Duration::from_millis(1099), SmoothScrollPhase::Ended)),
+        "the last tick must finish after its own 100 ms pulse"
+    );
+    assert_eq!(engine.next_deadline(), None);
+    assert!(engine.active.is_empty());
+}
+
+#[test]
 fn free_spin_burst_keeps_the_pulse_count_bounded() {
     let base = Instant::now();
     let mut engine = ScrollEngine::default();
