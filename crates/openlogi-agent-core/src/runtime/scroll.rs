@@ -11,8 +11,8 @@ mod worker;
 
 pub use worker::{ScrollInputHandle, ScrollPreferences, ScrollRuntime};
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
@@ -21,8 +21,6 @@ use openlogi_inject::SmoothScrollPhase;
 
 use crate::runtime::HidppSessionId;
 
-/// Duration of every segment, including a segment restarted by retargeting.
-const ANIMATION_DURATION: Duration = Duration::from_millis(100);
 /// Output cadence. Position is evaluated from absolute time, so delayed wakes
 /// do not slow or lengthen the animation.
 const FRAME_PERIOD: Duration = Duration::from_millis(8);
@@ -31,15 +29,88 @@ const FRAME_PERIOD: Duration = Duration::from_millis(8);
 /// above the gap between ratchet ticks of a continuous spin and far below the
 /// pause between separate spins.
 const PHASED_IDLE: Duration = Duration::from_millis(120);
+/// Sliding window over which a source's recent tick distance becomes its
+/// wheel rate for acceleration. Sized so a notched wheel emitting one full
+/// tick every `dt < ACCEL_WINDOW` reproduces the classic per-interval gain.
+const ACCEL_WINDOW: Duration = Duration::from_millis(70);
+/// Numerator of the tick-rate acceleration curve, in milliseconds: a source
+/// whose window holds one tick per `dt` ms gains `(1 + ACCEL_RATE_MS/dt) / 2`,
+/// clamped between 1 and the configured cap.
+const ACCEL_RATE_MS: f64 = 30.0;
+/// Upper bound on remembered window entries; overflow drops the oldest, which
+/// can only understate the rate. 128 entries cover ~1.8 kHz reporting across
+/// the full window — beyond any real wheel.
+const ACCEL_WINDOW_MAX_TICKS: usize = 128;
+/// Ratio of the pulse curve's viscous tail to its damped-force head.
+const PULSE_TAIL_RATIO: f64 = 3.0;
+/// Upper bound on in-flight pulses per source; free-spin bursts merge into
+/// the newest pulse past this (see [`ActiveMotion::add_tick`]), keeping frame
+/// evaluation O(1)-ish.
+const MAX_PULSES: usize = 64;
+/// Normalized two-phase pulse: a damped-force head (`u − 1 + e^(−u)`) blending
+/// C¹-continuously into an exponential viscous tail at one part head to
+/// [`PULSE_TAIL_RATIO`] parts tail, rescaled so `P(0) = 0` and `P(1) = 1`.
+/// Monotone in between; clamped outside.
+fn pulse_curve(progress: f64) -> f64 {
+    fn raw(u: f64) -> f64 {
+        if u < 1.0 {
+            u - 1.0 + (-u).exp()
+        } else {
+            let head_end = (-1.0_f64).exp();
+            head_end + (1.0 - head_end) * (1.0 - (1.0 - u).exp())
+        }
+    }
+    let scale = 1.0 + PULSE_TAIL_RATIO;
+    (raw(progress.clamp(0.0, 1.0) * scale) / raw(scale)).clamp(0.0, 1.0)
+}
+
+/// Amplitude gain for a source whose ticks summed to `window_ticks` of raw
+/// wheel distance across the trailing [`ACCEL_WINDOW`]. Rate-based rather
+/// than interval-based: a high-resolution or free-spin wheel reports many
+/// tiny deltas milliseconds apart, so the gap between events says nothing
+/// about how fast the wheel is actually turning — only the distance covered
+/// per unit time does. A notched wheel (one full tick per report, `dt`
+/// apart) fills the window with `ACCEL_WINDOW/dt` ticks and lands on the
+/// classic `(1 + ACCEL_RATE_MS/dt) / 2` within one tick's worth of rate.
+/// Deliberately deterministic so traces are exactly testable.
+fn accel_gain(window_ticks: f64, max_gain: f64) -> f64 {
+    let rate_per_ms = window_ticks / (ACCEL_WINDOW.as_secs_f64() * 1000.0);
+    f64::midpoint(1.0, ACCEL_RATE_MS * rate_per_ms).clamp(1.0, max_gain)
+}
+
+/// Motion settings resolved when the worker takes a tick off its queue and
+/// kept with that tick's pulse, so a live settings change never re-times or
+/// rescales motion already under way. A tick still queued when a setting
+/// changes takes the new value, exactly as the smoothing toggle does.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MotionTuning {
+    /// Amplitude multiplier per wheel tick, in native lines.
+    pub(crate) step: f64,
+    /// Animation length of one tick's pulse.
+    pub(crate) duration: Duration,
+    /// Cap on [`accel_gain`]; `1.0` disables acceleration.
+    pub(crate) max_gain: f64,
+    /// Per-axis sensitivity already applied to the tick before it was queued
+    /// (an OS hook's vertical wheel sensitivity, a thumb wheel's own
+    /// sensitivity; [`WheelDelta::UNIT`] otherwise). The rate window divides
+    /// it back out, so sensitivity scales distance only and never how fast
+    /// the wheel appears to turn.
+    pub(crate) distance_scale: WheelDelta,
+    /// Whether distances already carry the OS acceleration curve. A new
+    /// opposing tick replaces that axis's pending tail without changing the
+    /// accepted input magnitude.
+    pub(crate) preaccelerated: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct WheelDelta {
+pub(crate) struct WheelDelta {
     x: f64,
     y: f64,
 }
 
 impl WheelDelta {
     const ZERO: Self = Self { x: 0.0, y: 0.0 };
+    const UNIT: Self = Self { x: 1.0, y: 1.0 };
 
     fn is_zero(self) -> bool {
         self.x == 0.0 && self.y == 0.0
@@ -63,6 +134,14 @@ impl WheelDelta {
         Self {
             x: self.x * factor,
             y: self.y * factor,
+        }
+    }
+
+    /// Scale each axis by its own factor.
+    fn scale_axes(self, factors: Self) -> Self {
+        Self {
+            x: self.x * factors.x,
+            y: self.y * factors.y,
         }
     }
 
@@ -103,15 +182,26 @@ impl From<WheelDelta> for ScrollDelta {
 struct ScrollFrame {
     delta: WheelDelta,
     phase: SmoothScrollPhase,
+    /// The frame belongs to a phased gesture whose phases the application
+    /// must see, rather than to smoothed wheel output.
+    phased: bool,
 }
 
 impl ScrollFrame {
-    fn new(delta: WheelDelta, phase: SmoothScrollPhase) -> Self {
-        Self { delta, phase }
+    fn new(delta: WheelDelta, phase: SmoothScrollPhase, phased: bool) -> Self {
+        Self {
+            delta,
+            phase,
+            phased,
+        }
     }
 
     fn post(self) {
-        openlogi_inject::post_smooth_scroll(self.delta.into(), self.phase);
+        if self.phased {
+            openlogi_inject::post_phased_scroll(self.delta.into(), self.phase);
+        } else {
+            openlogi_inject::post_smooth_scroll(self.delta.into(), self.phase);
+        }
     }
 }
 
@@ -131,23 +221,28 @@ impl ScrollSource {
     }
 }
 
-/// A finite cubic smoothstep segment between two cumulative positions.
-struct MotionSegment {
-    from: WheelDelta,
-    target: WheelDelta,
+/// One tick's finite animation: `amplitude × pulse_curve(elapsed/duration)`.
+struct Pulse {
+    amplitude: WheelDelta,
     started_at: Instant,
+    duration: Duration,
+    /// Arrival of the first tick this pulse absorbed. The frame-window merge
+    /// in [`ActiveMotion::add_tick`] is measured from here rather than from
+    /// `started_at`, which a merge moves forward — so a steady stream still
+    /// hands off to a fresh pulse one frame after each pulse began instead of
+    /// restarting the same pulse forever.
+    anchor: Instant,
 }
 
-impl MotionSegment {
+impl Pulse {
     fn position_at(&self, at: Instant) -> WheelDelta {
         let elapsed = at.saturating_duration_since(self.started_at);
-        let progress = (elapsed.as_secs_f64() / ANIMATION_DURATION.as_secs_f64()).clamp(0.0, 1.0);
-        let eased = progress * progress * (3.0 - 2.0 * progress);
-        self.from.plus(self.target.minus(self.from).scale(eased))
+        let progress = elapsed.as_secs_f64() / self.duration.as_secs_f64();
+        self.amplitude.scale(pulse_curve(progress))
     }
 
     fn ends_at(&self) -> Instant {
-        self.started_at + ANIMATION_DURATION
+        self.started_at + self.duration
     }
 
     fn is_complete_at(&self, at: Instant) -> bool {
@@ -155,61 +250,238 @@ impl MotionSegment {
     }
 }
 
-/// A source exists in the state map only while it has a non-zero remaining
-/// target.
+/// A source exists in the state map only while it has in-flight pulses.
+///
+/// Overlapping pulses superpose: the source's position is the settled distance
+/// of completed pulses plus every live pulse's current contribution. Opposite
+/// raw ticks conserve their net distance. Already accelerated OS input
+/// replaces an opposing axis's pending tail so smoothing cannot keep pushing
+/// against the latest wheel direction.
 struct ActiveMotion {
-    segment: MotionSegment,
+    pulses: Vec<Pulse>,
+    /// Completed-pulse offset, rebased to the last emitted position when an
+    /// opposing axis cancels its pending tail.
+    settled: WheelDelta,
     emitted: WheelDelta,
+    /// A timer can advance a source before a previously timestamped hook
+    /// input reaches the queue. Position evaluations must never rewind it.
+    evaluated_at: Instant,
     next_frame: Instant,
+    /// Trailing [`ACCEL_WINDOW`] of accepted ticks — `(arrival, unsigned raw
+    /// wheel distance per axis)` — from which [`accel_gain`] derives each
+    /// axis's own rate, so a fast spin on one axis never accelerates slow
+    /// movement on the other.
+    recent_ticks: VecDeque<(Instant, WheelDelta)>,
 }
 
 impl ActiveMotion {
-    fn new(impulse: WheelDelta, at: Instant) -> Self {
-        Self {
-            segment: MotionSegment {
-                from: WheelDelta::ZERO,
-                target: impulse,
-                started_at: at,
-            },
+    fn new(impulse: WheelDelta, at: Instant, tuning: MotionTuning) -> Self {
+        let mut motion = Self {
+            pulses: Vec::new(),
+            settled: WheelDelta::ZERO,
             emitted: WheelDelta::ZERO,
+            evaluated_at: at,
             next_frame: at + FRAME_PERIOD,
+            recent_ticks: VecDeque::new(),
+        };
+        let gain = motion.windowed_gain(impulse, at, tuning);
+        motion.pulses.push(Pulse {
+            amplitude: impulse.scale(tuning.step).scale_axes(gain),
+            started_at: at,
+            duration: tuning.duration,
+            anchor: at,
+        });
+        motion
+    }
+
+    /// Record one tick in the rate window and return each axis's amplitude
+    /// gain. The window holds the wheel's own distance, with any queue-side
+    /// sensitivity divided back out.
+    fn windowed_gain(
+        &mut self,
+        impulse: WheelDelta,
+        at: Instant,
+        tuning: MotionTuning,
+    ) -> WheelDelta {
+        while self
+            .recent_ticks
+            .front()
+            .is_some_and(|(tick_at, _)| at.saturating_duration_since(*tick_at) > ACCEL_WINDOW)
+        {
+            self.recent_ticks.pop_front();
+        }
+        self.recent_ticks.push_back((
+            at,
+            WheelDelta {
+                x: impulse.x.abs() / tuning.distance_scale.x,
+                y: impulse.y.abs() / tuning.distance_scale.y,
+            },
+        ));
+        if self.recent_ticks.len() > ACCEL_WINDOW_MAX_TICKS {
+            self.recent_ticks.pop_front();
+        }
+        let window_ticks = self
+            .recent_ticks
+            .iter()
+            .fold(WheelDelta::ZERO, |sum, (_, ticks)| sum.plus(*ticks));
+        WheelDelta {
+            x: accel_gain(window_ticks.x, tuning.max_gain),
+            y: accel_gain(window_ticks.y, tuning.max_gain),
         }
     }
 
-    /// Evaluate the old segment at the impulse timestamp, then restart toward
-    /// the cumulative target.
-    fn retarget(&mut self, impulse: WheelDelta, at: Instant) -> MotionUpdate {
-        let position = self.segment.position_at(at);
-        let target = self.segment.target.plus(impulse);
-        let delta = self.delta_to(position);
-        if target == position {
-            return MotionUpdate::Finished(delta);
+    /// Superpose one tick's pulse, evaluating only an already-due frame.
+    ///
+    /// Ticks landing within one frame of the newest pulse's first tick merge
+    /// into that pulse when both run the same duration — but never by
+    /// inheriting its clock. The merge settles whatever the pulse has
+    /// delivered so far and restarts its remainder together with the new tick
+    /// from `at`: position is continuous, net distance is conserved, and the
+    /// tick neither starts partially progressed nor ends at an older pulse's
+    /// deadline. A tick accepted under a freshly reloaded duration gets its
+    /// own pulse instead, so a reload never re-times motion accepted under
+    /// the previous configuration. Only the [`MAX_PULSES`] bound merges
+    /// unconditionally; that is the one place the model approximates, and it
+    /// still conserves distance and continuity. Input never postpones the
+    /// scheduled frame or creates an extra frame between timer deadlines.
+    fn add_tick(
+        &mut self,
+        impulse: WheelDelta,
+        at: Instant,
+        tuning: MotionTuning,
+    ) -> Option<MotionUpdate> {
+        let reversed = tuning.preaccelerated && self.cancel_opposing_tail(impulse, at);
+        let gain = self.windowed_gain(impulse, at, tuning);
+        let amplitude = impulse.scale(tuning.step).scale_axes(gain);
+        let merge = self.pulses.len() >= MAX_PULSES
+            || (!reversed
+                && self.pulses.last().is_some_and(|pulse| {
+                    pulse.duration == tuning.duration
+                        && at.saturating_duration_since(pulse.anchor) < FRAME_PERIOD
+                }));
+        if merge && let Some(last) = self.pulses.last_mut() {
+            // Retain a delayed tick's own clock without undoing a timer's
+            // already-evaluated contribution from the pulse it merges into.
+            let delivered = last.position_at(at.max(self.evaluated_at));
+            self.settled = self.settled.plus(delivered);
+            let remainder = last.amplitude.minus(delivered).plus(amplitude);
+            if remainder.is_zero() {
+                self.pulses.pop();
+            } else {
+                last.amplitude = remainder;
+                last.started_at = at;
+                last.duration = tuning.duration;
+            }
+        } else {
+            self.pulses.push(Pulse {
+                amplitude,
+                started_at: at,
+                duration: tuning.duration,
+                anchor: at,
+            });
         }
+        if self.pulses.is_empty() {
+            // Equal opposing input may cancel before the first frame.
+            Some(self.evaluate(at))
+        } else if self.next_frame <= at {
+            Some(self.advance(at))
+        } else {
+            None
+        }
+    }
 
-        self.segment = MotionSegment {
-            from: position,
-            target,
-            started_at: at,
+    /// Anchor a reversed axis at its last emitted position. Its other axis
+    /// keeps the original pulse clocks, including within the merge window.
+    /// Completed animations still settle normally when a timer was delayed.
+    fn cancel_opposing_tail(&mut self, impulse: WheelDelta, at: Instant) -> bool {
+        let at = at.max(self.evaluated_at);
+        let pending = self
+            .pulses
+            .iter()
+            .fold(self.settled, |sum, pulse| sum.plus(pulse.amplitude))
+            .minus(self.emitted);
+        let opposes = |input: f64, remaining: f64| {
+            input != 0.0 && remaining != 0.0 && input.signum() != remaining.signum()
         };
-        self.next_frame = at + FRAME_PERIOD;
-        MotionUpdate::Active(delta)
+        let reverse_x = opposes(impulse.x, pending.x)
+            && self
+                .pulses
+                .iter()
+                .any(|pulse| pulse.amplitude.x != 0.0 && !pulse.is_complete_at(at));
+        let reverse_y = opposes(impulse.y, pending.y)
+            && self
+                .pulses
+                .iter()
+                .any(|pulse| pulse.amplitude.y != 0.0 && !pulse.is_complete_at(at));
+        if !reverse_x && !reverse_y {
+            return false;
+        }
+        if reverse_x {
+            self.settled.x = self.emitted.x;
+        }
+        if reverse_y {
+            self.settled.y = self.emitted.y;
+        }
+        for pulse in &mut self.pulses {
+            if reverse_x {
+                pulse.amplitude.x = 0.0;
+            }
+            if reverse_y {
+                pulse.amplitude.y = 0.0;
+            }
+        }
+        self.pulses.retain(|pulse| !pulse.amplitude.is_zero());
+        true
     }
 
     /// Evaluate the position at `at` and report whether the source remains
     /// active after this update.
     fn advance(&mut self, at: Instant) -> MotionUpdate {
-        let complete = self.segment.is_complete_at(at);
-        let position = self.segment.position_at(at);
-        let delta = self.delta_to(position);
-        if complete {
-            MotionUpdate::Finished(delta)
-        } else {
+        let at = at.max(self.evaluated_at);
+        let update = self.evaluate(at);
+        if !update.is_finished() {
             while self.next_frame <= at {
                 self.next_frame += FRAME_PERIOD;
             }
-            self.next_frame = self.next_frame.min(self.segment.ends_at());
+            if let Some(ends_at) = self.ends_at() {
+                self.next_frame = self.next_frame.min(ends_at);
+            }
+        }
+        update
+    }
+
+    fn evaluate(&mut self, at: Instant) -> MotionUpdate {
+        let at = at.max(self.evaluated_at);
+        self.evaluated_at = at;
+        let position = self.position_at(at);
+        let delta = self.delta_to(position);
+        self.prune(at);
+        if self.pulses.is_empty() {
+            MotionUpdate::Finished(delta)
+        } else {
             MotionUpdate::Active(delta)
         }
+    }
+
+    fn position_at(&self, at: Instant) -> WheelDelta {
+        self.pulses
+            .iter()
+            .fold(self.settled, |sum, pulse| sum.plus(pulse.position_at(at)))
+    }
+
+    fn prune(&mut self, at: Instant) {
+        self.pulses.retain(|pulse| {
+            if pulse.is_complete_at(at) {
+                self.settled = self.settled.plus(pulse.amplitude);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn ends_at(&self) -> Option<Instant> {
+        self.pulses.iter().map(Pulse::ends_at).max()
     }
 
     fn delta_to(&mut self, position: WheelDelta) -> WheelDelta {
@@ -236,45 +508,58 @@ impl MotionUpdate {
 /// motions may overlap, but Core Graphics has no source identity with which to
 /// pair multiple synthetic gestures; all distances therefore share this single
 /// balanced lifecycle.
+///
+/// Whoever opens the stream decides whether it is a phased gesture (`phased`
+/// on the opening frame), and every frame up to its end keeps that choice, so
+/// the application never sees a gesture that changes kind half-way.
 #[derive(Default)]
 enum OutputStream {
     #[default]
     Idle,
-    Active,
+    Active {
+        phased: bool,
+    },
 }
 
 impl OutputStream {
-    fn progress(&mut self, delta: WheelDelta, emit: &mut impl FnMut(ScrollFrame)) {
+    fn progress(&mut self, delta: WheelDelta, phased: bool, emit: &mut impl FnMut(ScrollFrame)) {
         if delta.is_zero() {
             return;
         }
-        let phase = match self {
+        let (phase, phased) = match *self {
             Self::Idle => {
-                *self = Self::Active;
-                SmoothScrollPhase::Began
+                *self = Self::Active { phased };
+                (SmoothScrollPhase::Began, phased)
             }
-            Self::Active => SmoothScrollPhase::Changed,
+            Self::Active { phased } => (SmoothScrollPhase::Changed, phased),
         };
-        emit(ScrollFrame::new(delta, phase));
+        emit(ScrollFrame::new(delta, phase, phased));
     }
 
-    fn finish(&mut self, delta: WheelDelta, emit: &mut impl FnMut(ScrollFrame)) {
-        match self {
+    fn finish(&mut self, delta: WheelDelta, phased: bool, emit: &mut impl FnMut(ScrollFrame)) {
+        match *self {
             Self::Idle if !delta.is_zero() => {
-                emit(ScrollFrame::new(delta, SmoothScrollPhase::Began));
-                emit(ScrollFrame::new(WheelDelta::ZERO, SmoothScrollPhase::Ended));
+                emit(ScrollFrame::new(delta, SmoothScrollPhase::Began, phased));
+                emit(ScrollFrame::new(
+                    WheelDelta::ZERO,
+                    SmoothScrollPhase::Ended,
+                    phased,
+                ));
             }
-            Self::Active => emit(ScrollFrame::new(delta, SmoothScrollPhase::Ended)),
+            Self::Active { phased } => {
+                emit(ScrollFrame::new(delta, SmoothScrollPhase::Ended, phased));
+            }
             Self::Idle => {}
         }
         *self = Self::Idle;
     }
 
     fn cancel(&mut self, emit: &mut impl FnMut(ScrollFrame)) {
-        if matches!(self, Self::Active) {
+        if let Self::Active { phased } = *self {
             emit(ScrollFrame::new(
                 WheelDelta::ZERO,
                 SmoothScrollPhase::Cancelled,
+                phased,
             ));
         }
         *self = Self::Idle;
@@ -300,28 +585,19 @@ impl ScrollEngine {
         source: ScrollSource,
         impulse: WheelDelta,
         at: Instant,
+        tuning: MotionTuning,
         emit: &mut impl FnMut(ScrollFrame),
     ) {
-        if self
-            .active
-            .get(&source)
-            .is_some_and(|motion| motion.segment.is_complete_at(at))
-            && let Some(mut completed) = self.active.remove(&source)
-        {
-            let update = completed.advance(at);
-            self.emit_update(update, emit);
-        }
-
         let update = match self.active.entry(source) {
             Entry::Occupied(mut entry) => {
-                let update = entry.get_mut().retarget(impulse, at);
-                if update.is_finished() {
+                let update = entry.get_mut().add_tick(impulse, at, tuning);
+                if update.is_some_and(|update| update.is_finished()) {
                     entry.remove();
                 }
-                Some(update)
+                update
             }
             Entry::Vacant(entry) => {
-                entry.insert(ActiveMotion::new(impulse, at));
+                entry.insert(ActiveMotion::new(impulse, at, tuning));
                 None
             }
         };
@@ -340,7 +616,7 @@ impl ScrollEngine {
         emit: &mut impl FnMut(ScrollFrame),
     ) {
         self.end_idle_phased(at, emit);
-        self.output.progress(impulse, emit);
+        self.output.progress(impulse, true, emit);
         self.phased.insert(source, at + PHASED_IDLE);
     }
 
@@ -373,7 +649,7 @@ impl ScrollEngine {
         let before = self.phased.len();
         self.phased.retain(|_, deadline| *deadline > at);
         if self.phased.len() != before && self.phased.is_empty() && self.active.is_empty() {
-            self.output.finish(WheelDelta::ZERO, emit);
+            self.output.finish(WheelDelta::ZERO, true, emit);
         }
     }
 
@@ -405,10 +681,10 @@ impl ScrollEngine {
             // A phased gesture still open (after a smoothing toggle) owns the
             // stream's end, so a motion finishing under it only progresses it.
             MotionUpdate::Finished(delta) if self.active.is_empty() && self.phased.is_empty() => {
-                self.output.finish(delta, emit);
+                self.output.finish(delta, false, emit);
             }
             MotionUpdate::Active(delta) | MotionUpdate::Finished(delta) => {
-                self.output.progress(delta, emit);
+                self.output.progress(delta, false, emit);
             }
         }
     }
