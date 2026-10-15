@@ -31,7 +31,7 @@ fn tuning(step: f64, duration_ms: u64, max_gain: f64) -> MotionTuning {
 }
 
 /// Step 1×, pre-accelerated input: gain stays off (as the worker forces on
-/// that path) and quick reversals cool down.
+/// that path); opposing input replaces only its axis's pending tail.
 fn preaccelerated() -> MotionTuning {
     MotionTuning {
         preaccelerated: true,
@@ -1091,82 +1091,12 @@ fn acceleration_windows_are_kept_per_axis() {
 }
 
 #[test]
-fn reversal_cooldown_scales_by_time_since_the_departed_direction() {
-    const EPSILON: f64 = 1.0e-9;
-    let base = Instant::now();
-    let at = |millis| base + Duration::from_millis(millis);
-    let mut cooldown = ReversalCooldown::default();
-    // First input commits a direction unscaled.
-    assert!((cooldown.attenuate(-5.0, at(0)) + 5.0).abs() < EPSILON);
-    // A flip 68 ms later (the measured hot case) passes 68/400 of its value.
-    assert!((cooldown.attenuate(4.0, at(68)) - 4.0 * 0.17).abs() < EPSILON);
-    // The committed new direction keeps ramping against the same reference
-    // (2.0 stays below the knee, so only the ramp scales it).
-    assert!((cooldown.attenuate(4.0, at(200)) - 4.0 * 0.5).abs() < EPSILON);
-    // Once the ramp elapses only the knee compression remains, fading with
-    // the corrective burst's age (332 ms of the 2000 ms recovery).
-    let compressed = 3.25 + (4.0 - 3.25) * (332.0 / 2000.0);
-    assert!((cooldown.attenuate(4.0, at(400)) - compressed).abs() < EPSILON);
-    // A tick after the full recovery window runs unscaled.
-    assert!((cooldown.attenuate(4.0, at(2068)) - 4.0).abs() < EPSILON);
-}
-
-#[test]
-fn reversal_compression_tames_the_corrective_burst_and_fades() {
-    const EPSILON: f64 = 1.0e-9;
-    let base = Instant::now();
-    let at = |millis| base + Duration::from_millis(millis);
-    let mut cooldown = ReversalCooldown::default();
-    assert!((cooldown.attenuate(-5.0, at(0)) + 5.0).abs() < EPSILON);
-    // A flip 300 ms later is still on the ramp (3/4) and fully compressed:
-    // 8 × 0.75 = 6 lines → 3 + 3/4 at the burst's start.
-    assert!((cooldown.attenuate(8.0, at(300)) - 3.75).abs() < EPSILON);
-    // The burst keeps the axis warm. Past the ramp it is still compressed
-    // above the knee (8 → 3 + 5/4), and halfway through recovery the
-    // compression has faded halfway.
-    for millis in (400..1300).step_by(100) {
-        cooldown.attenuate(8.0, at(millis));
-    }
-    assert!((cooldown.attenuate(8.0, at(1300)) - (4.25 + 3.75 * 0.5)).abs() < EPSILON);
-    // Past recovery the burst runs at full magnitude again.
-    for millis in (1400..2300).step_by(100) {
-        cooldown.attenuate(8.0, at(millis));
-    }
-    assert!((cooldown.attenuate(8.0, at(2300)) - 8.0).abs() < EPSILON);
-}
-
-#[test]
-fn quick_reversal_of_preaccelerated_input_restarts_cold() {
-    let base = Instant::now();
-    let mut engine = ScrollEngine::default();
-    let mut frames = Vec::new();
-    // Hot downward stream, then an opposing tick 40 ms after its last tick:
-    // the reversal passes only 40/400 of its pre-accelerated magnitude.
-    for (millis, delta) in [(0, -5.0), (50, -5.0), (90, 5.0)] {
-        engine.impulse(
-            source(),
-            wheel(0.0, delta),
-            base + Duration::from_millis(millis),
-            preaccelerated(),
-            &mut |frame| frames.push(frame),
-        );
-    }
-    engine.advance_due(base + Duration::from_millis(300), &mut |frame| {
-        frames.push(frame);
-    });
-    assert_delta(cumulative(&frames), wheel(0.0, -5.0 - 5.0 + 0.5));
-    assert!(engine.active.is_empty());
-}
-
-#[test]
 fn leisurely_reversal_starts_fresh_and_unscaled() {
     let base = Instant::now();
     let mut engine = ScrollEngine::default();
     let mut frames = Vec::new();
-    // The opposing tick arrives a full cooldown after the departed
-    // direction's last tick: the OS curve is cold again, the source's
-    // reversal state has expired, and the tick passes whole — not even the
-    // knee compression applies to a flip that is not a corrective flick.
+    // The opposing tick arrives after the original pulses' deadlines. Even
+    // without an intervening timer wake, their completed distance settles.
     for (millis, delta) in [(0, -5.0), (50, -5.0), (460, 5.0)] {
         engine.impulse(
             source(),
@@ -1180,122 +1110,6 @@ fn leisurely_reversal_starts_fresh_and_unscaled() {
         frames.push(frame);
     });
     assert_delta(cumulative(&frames), wheel(0.0, -10.0 + 5.0));
-    assert!(engine.active.is_empty());
-}
-
-#[test]
-fn reversal_cooldown_outlives_a_finished_animation() {
-    let base = Instant::now();
-    let mut engine = ScrollEngine::default();
-    let mut frames = Vec::new();
-    // A 100 ms pulse finishes long before the 400 ms cooldown does. The
-    // source is retired at the frame that completes it, yet an opposing tick
-    // 168 ms after the departed direction's last tick still ramps: it passes
-    // 168/400 of its magnitude (below the knee, so the ramp alone applies).
-    for (millis, delta) in [(0, -5.0), (50, -5.0)] {
-        engine.impulse(
-            source(),
-            wheel(0.0, delta),
-            base + Duration::from_millis(millis),
-            preaccelerated(),
-            &mut |frame| frames.push(frame),
-        );
-    }
-    engine.advance_due(base + Duration::from_millis(200), &mut |frame| {
-        frames.push(frame);
-    });
-    assert!(engine.active.is_empty(), "animation finished and retired");
-    engine.impulse(
-        source(),
-        wheel(0.0, 4.0),
-        base + Duration::from_millis(218),
-        preaccelerated(),
-        &mut |frame| frames.push(frame),
-    );
-    engine.advance_due(base + Duration::from_millis(400), &mut |frame| {
-        frames.push(frame);
-    });
-    assert_delta(cumulative(&frames), wheel(0.0, -10.0 + 4.0 * 0.42));
-    assert!(engine.active.is_empty());
-}
-
-#[test]
-fn free_spin_jitter_never_scales_the_resumed_direction() {
-    let base = Instant::now();
-    let mut engine = ScrollEngine::default();
-    let mut frames = Vec::new();
-    // A sub-commit opposing jitter tick is itself attenuated (0.2 × 30/400)
-    // but must not cool the main direction when it resumes.
-    for (millis, delta) in [(0, -5.0), (50, -5.0), (80, 0.2), (120, -5.0)] {
-        engine.impulse(
-            source(),
-            wheel(0.0, delta),
-            base + Duration::from_millis(millis),
-            preaccelerated(),
-            &mut |frame| frames.push(frame),
-        );
-    }
-    engine.advance_due(base + Duration::from_millis(400), &mut |frame| {
-        frames.push(frame);
-    });
-    assert_delta(cumulative(&frames), wheel(0.0, -15.0 + 0.2 * 0.075));
-    assert!(engine.active.is_empty());
-}
-
-/// Pre-accelerated OS-hook input at vertical sensitivity 28: each line is
-/// queued as two.
-fn preaccelerated_at_double_sensitivity() -> MotionTuning {
-    MotionTuning {
-        distance_scale: wheel(1.0, 2.0),
-        ..preaccelerated()
-    }
-}
-
-#[test]
-fn sensitivity_never_turns_jitter_into_a_reversal() {
-    let base = Instant::now();
-    let mut engine = ScrollEngine::default();
-    let mut frames = Vec::new();
-    // A 0.3-line backward jitter arrives as 0.6 at double sensitivity. It is
-    // still below the commit floor in the wheel's own lines, so the resumed
-    // main direction passes whole instead of cooling to 40/400 of itself.
-    for (millis, delta) in [(0, -10.0), (50, -10.0), (80, 0.6), (120, -10.0)] {
-        engine.impulse(
-            source(),
-            wheel(0.0, delta),
-            base + Duration::from_millis(millis),
-            preaccelerated_at_double_sensitivity(),
-            &mut |frame| frames.push(frame),
-        );
-    }
-    engine.advance_due(base + Duration::from_millis(400), &mut |frame| {
-        frames.push(frame);
-    });
-    assert_delta(cumulative(&frames), wheel(0.0, -30.0 + 0.6 * 0.075));
-    assert!(engine.active.is_empty());
-}
-
-#[test]
-fn reversal_knee_compresses_the_same_motion_at_any_sensitivity() {
-    let base = Instant::now();
-    let mut engine = ScrollEngine::default();
-    let mut frames = Vec::new();
-    // The flip from `reversal_compression_tames_the_corrective_burst_and_fades`
-    // at double sensitivity: 8 lines × 3/4 ramp = 6 → 3.75 at the knee, then
-    // doubled, rather than knee-compressing the doubled 12 to 5.25.
-    for (millis, delta) in [(0, -10.0), (100, -10.0), (400, 16.0)] {
-        engine.impulse(
-            source(),
-            wheel(0.0, delta),
-            base + Duration::from_millis(millis),
-            preaccelerated_at_double_sensitivity(),
-            &mut |frame| frames.push(frame),
-        );
-    }
-    engine.advance_due(base + Duration::from_millis(700), &mut |frame| {
-        frames.push(frame);
-    });
-    assert_delta(cumulative(&frames), wheel(0.0, -20.0 + 3.75 * 2.0));
     assert!(engine.active.is_empty());
 }
 
@@ -1319,6 +1133,136 @@ fn raw_input_reverses_without_attenuation() {
         frames.push(frame);
     });
     assert_delta(cumulative(&frames), wheel(0.0, 0.0));
+    assert!(engine.active.is_empty());
+}
+
+#[test]
+fn preaccelerated_reversal_stops_the_old_tail_and_keeps_the_new_distance() {
+    let base = Instant::now();
+    let mut engine = ScrollEngine::default();
+    let mut frames = Vec::new();
+    let settings = MotionTuning {
+        preaccelerated: true,
+        ..tuning(2.0, 360, 1.0)
+    };
+    engine.impulse(source(), wheel(0.0, 3.0), base, settings, &mut |frame| {
+        frames.push(frame);
+    });
+    for millis in (8..=40).step_by(8) {
+        engine.advance_due(base + Duration::from_millis(millis), &mut |frame| {
+            frames.push(frame);
+        });
+    }
+    assert!(cumulative(&frames).y > 0.0);
+    frames.clear();
+
+    engine.impulse(
+        source(),
+        wheel(0.0, -3.0),
+        base + Duration::from_millis(40),
+        settings,
+        &mut |frame| frames.push(frame),
+    );
+    engine.advance_due(base + Duration::from_millis(48), &mut |frame| {
+        frames.push(frame);
+    });
+    assert!(
+        frames.first().is_some_and(|frame| frame.delta.y < 0.0),
+        "the first scheduled frame after a reversal must follow the new direction"
+    );
+    for millis in (56..=400).step_by(8) {
+        engine.advance_due(base + Duration::from_millis(millis), &mut |frame| {
+            frames.push(frame);
+        });
+    }
+    assert!(frames.iter().all(|frame| frame.delta.y <= 0.0));
+    assert_delta(cumulative(&frames), wheel(0.0, -6.0));
+    assert!(engine.active.is_empty());
+}
+
+#[test]
+fn preaccelerated_reversal_leaves_the_other_axis_on_its_original_clock() {
+    let base = Instant::now();
+    let settings = MotionTuning {
+        preaccelerated: true,
+        ..tuning(2.0, 360, 1.0)
+    };
+    for reversal in [wheel(-3.0, 0.0), wheel(0.0, -4.0)] {
+        for reversal_at in [4, 36] {
+            let mut engine = ScrollEngine::default();
+            let mut baseline = ScrollEngine::default();
+            let mut frames = Vec::new();
+            let mut original = Vec::new();
+            for motion in [&mut engine, &mut baseline] {
+                motion.impulse(source(), wheel(3.0, 4.0), base, settings, &mut |_| {});
+                for millis in (8..reversal_at).step_by(8) {
+                    motion.advance_due(base + Duration::from_millis(millis), &mut |_| {});
+                }
+            }
+            // Between frame deadlines, so cancelling one axis cannot restart the
+            // other axis's pulse or move its next frame to the input timestamp.
+            engine.impulse(
+                source(),
+                reversal,
+                base + Duration::from_millis(reversal_at),
+                settings,
+                &mut |frame| frames.push(frame),
+            );
+            assert!(frames.is_empty());
+            for millis in ((reversal_at / 8 + 1) * 8..=reversal_at + 368).step_by(8) {
+                engine.advance_due(base + Duration::from_millis(millis), &mut |frame| {
+                    frames.push(frame);
+                });
+                baseline.advance_due(base + Duration::from_millis(millis), &mut |frame| {
+                    original.push(frame);
+                });
+            }
+            let untouched = |delta: WheelDelta| {
+                if reversal.x == 0.0 { delta.x } else { delta.y }
+            };
+            let reversed = |delta: WheelDelta| {
+                if reversal.x == 0.0 { delta.y } else { delta.x }
+            };
+            assert!(reversed(frames[0].delta) < 0.0);
+            for (frame, original) in frames.iter().zip(&original) {
+                assert!((untouched(frame.delta) - untouched(original.delta)).abs() < 1.0e-9);
+            }
+            assert!(
+                (untouched(cumulative(&frames)) - untouched(cumulative(&original))).abs() < 1.0e-9
+            );
+            assert!(frames.iter().all(|frame| reversed(frame.delta) <= 0.0));
+            assert!((reversed(cumulative(&frames)) - reversed(reversal) * 2.0).abs() < 1.0e-9);
+            assert!(engine.active.is_empty());
+        }
+    }
+}
+
+#[test]
+fn preaccelerated_reversal_after_a_finished_pulse_keeps_full_input() {
+    let base = Instant::now();
+    let mut engine = ScrollEngine::default();
+    let mut frames = Vec::new();
+    engine.impulse(
+        source(),
+        wheel(0.0, 3.0),
+        base,
+        preaccelerated(),
+        &mut |frame| frames.push(frame),
+    );
+    engine.advance_due(base + Duration::from_millis(100), &mut |frame| {
+        frames.push(frame);
+    });
+    engine.impulse(
+        source(),
+        wheel(0.0, -3.0),
+        base + Duration::from_millis(120),
+        preaccelerated(),
+        &mut |frame| frames.push(frame),
+    );
+    engine.advance_due(base + Duration::from_millis(220), &mut |frame| {
+        frames.push(frame);
+    });
+    assert_delta(cumulative(&frames), WheelDelta::ZERO);
     assert!(engine.active.is_empty());
 }
 
@@ -1368,10 +1312,8 @@ fn another_axis_never_keeps_a_cold_reversal_hot() {
     let base = Instant::now();
     let mut engine = ScrollEngine::default();
     let mut frames = Vec::new();
-    // Scroll down, then sideways for longer than a cooldown, then flip the
-    // vertical direction with a big tick. The horizontal ticks keep the
-    // source alive, but the vertical axis has been quiet for 550 ms, so the
-    // flip is cold and must pass whole rather than knee-compressed to 4.25.
+    // Horizontal input keeps the source alive after its vertical pulses
+    // finish. A later vertical reversal retains the full accepted distance.
     let ticks = [
         (0, wheel(0.0, -5.0)),
         (50, wheel(0.0, -5.0)),
@@ -1394,4 +1336,74 @@ fn another_axis_never_keeps_a_cold_reversal_hot() {
     });
     assert_delta(cumulative(&frames), wheel(3.0, -5.0 - 5.0 + 8.0));
     assert!(engine.active.is_empty());
+}
+
+#[test]
+fn preaccelerated_diagonal_reversals_keep_the_pulse_cap_and_other_axis_distance() {
+    let base = Instant::now();
+    let mut engine = ScrollEngine::default();
+    let mut frames = Vec::new();
+    let settings = MotionTuning {
+        preaccelerated: true,
+        ..tuning(1.0, 1000, 1.0)
+    };
+    for index in 0..256 {
+        let vertical = if index % 2 == 0 { 1.0 } else { -1.0 };
+        engine.impulse(
+            source(),
+            wheel(1.0, vertical),
+            base + Duration::from_millis(index * 4),
+            settings,
+            &mut |frame| frames.push(frame),
+        );
+        assert!(engine.active[&source()].pulses.len() <= MAX_PULSES);
+    }
+    engine.advance_due(base + Duration::from_millis(2100), &mut |frame| {
+        frames.push(frame);
+    });
+    assert!((cumulative(&frames).x - 256.0).abs() < 1.0e-9);
+    assert!(engine.active.is_empty());
+    assert_eq!(frames.first().unwrap().phase, SmoothScrollPhase::Began);
+    assert_eq!(frames.last().unwrap().phase, SmoothScrollPhase::Ended);
+}
+
+#[test]
+fn delayed_preaccelerated_reversal_keeps_full_scaled_input_without_rewinding() {
+    let base = Instant::now();
+    for scale in [0.5, 1.0, 2.0] {
+        for direction in [-1.0, 1.0] {
+            let mut engine = ScrollEngine::default();
+            let mut frames = Vec::new();
+            let settings = MotionTuning {
+                distance_scale: wheel(1.0, scale),
+                preaccelerated: true,
+                ..tuning(2.0, 360, 1.0)
+            };
+            engine.impulse(
+                source(),
+                wheel(0.0, 3.0 * scale * direction),
+                base,
+                settings,
+                &mut |_| {},
+            );
+            engine.advance_due(base + Duration::from_millis(100), &mut |_| {});
+            engine.impulse(
+                source(),
+                wheel(0.0, -3.0 * scale * direction),
+                base + Duration::from_millis(99),
+                settings,
+                &mut |frame| frames.push(frame),
+            );
+            assert!(frames.is_empty());
+            engine.advance_due(base + Duration::from_millis(104), &mut |frame| {
+                frames.push(frame);
+            });
+            assert!(frames.first().unwrap().delta.y * direction < 0.0);
+            engine.advance_due(base + Duration::from_millis(500), &mut |frame| {
+                frames.push(frame);
+            });
+            assert_delta(cumulative(&frames), wheel(0.0, -6.0 * scale * direction));
+            assert!(engine.active.is_empty());
+        }
+    }
 }
